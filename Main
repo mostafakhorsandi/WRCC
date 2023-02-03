@@ -1,0 +1,222 @@
+var LC_ESRI_colection = ee.ImageCollection("users/khorsandimostafa/esri"),
+    TerraClimate = ee.ImageCollection("IDAHO_EPSCOR/TERRACLIMATE"),
+    Suit_Index = ee.Image("users/khorsandimostafa/IRAN_SI_Raster_MODE"),
+    B_L0 = ee.FeatureCollection("users/khorsandimostafa/Basins_LXX/B_L0");
+    // Region of interest = ROI0 : This is a featureCollection which I want to do calculations for each feature
+    // I chose these names for different scales: 
+    // B_L0 = National scale
+    // B_L1 = Level 1 Basins which includes 6 features 
+    // B_L2 = Level 2 Basins which includes 30 features
+    // B_L3 = Level 3 study areas which includes 609 features
+var ROI0 = B_L0;                  
+Map.addLayer(B_L0, {}, 'ROI');  
+var CC_function = function(ROI0) {  
+// This function will calculate Carrying capacity for each feature of ROI0 plus some crusial varibles including:
+  // 1: CarryingCapacity (person)
+  // 2: Area available for B (km2)
+  // 3: Required land for B at this carrying capacity (km2)
+  // 4: Available water in the region (MCM)
+  // 5: Required water to evapotranpirated from A lands (MCM)
+  var SI = Suit_Index.clip(ROI0); // clip the SI layer for the study area
+  var SI_B = Suit_Index.clip(ROI0);
+  // We calculate the carrying capacity of this region using below code.
+  // Scenario Analysis for Carrying capacity extreme values
+  // var SI_threshold = ee.Number(ROI0.get('SI_balance')); // Level of Suitability Index (SI) which Available Water = AET
+  var SI_threshold = ee.Number(0.8); // Level of acceptable Suitability Index (SI)
+  // We need to calculate A, B, C
+  //  A = Productive Area (m2)      Lands with SI
+  var A = SI.where(SI.gt(SI_threshold), 1);
+  var A = A.where(A.lte(SI_threshold), 0); 
+  // Calculating area for A areas
+  var areaImage = A.multiply(ee.Image.pixelArea());
+  var area = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ROI0.geometry(),
+    scale: 500,
+    maxPixels: 1e10
+    });
+  var B = ee.Number(1500);  // var B = 750; //  B = Non-agricultural used area per person (m2)
+  // Carrying capacity simple estimation
+  // To get the value of calculated area as variable A
+  var Sorat = ee.Number(area.get('b1'));
+  var Sorat_km2 = Sorat.divide(ee.Number(1000000));
+  var K_num = Sorat.divide(B);
+  var K = ee.Number(K_num).round(); // this is the maximum theoretical Carrying capacity while using the maximum amount of water
+                                    // for the best lands for agriculture
+  var test = ROI0.set('CarryingCapacity', K); //add a field to ROI0 as Carrying capacity
+//--------------------------------------------------------------------------------------------
+// Check for land availability for B
+  var B_sum = K.multiply(B).divide(1000000); // = 'Required land for B at this carrying capacity (km2)'
+// Calculate the area available for B based on SI_B raster layer
+// We assign 1 for cells suitable for B and 0 for non-suitable one.
+  var available_B = SI_B.where(SI_B.gte(0).and(SI_B.lte(SI_threshold)), 1);
+  var available_B = available_B.where(available_B.eq(-1), 0);
+  var available_B = available_B.where(available_B.gte(SI_threshold).and(available_B.neq(1)), 0);
+// Calculating area for B areas
+  var areaB = available_B.multiply(ee.Image.pixelArea());
+  var areaB_total = areaB.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ROI0.geometry(),
+    scale: 500,
+    maxPixels: 1e10
+    });
+  var AreaBKm2 =  ee.Number(areaB_total.get('b1')).divide(1000000);
+// --------- this section calculate the current situation in 2020 ----------------------------
+var combined_img = LC_ESRI_colection.mosaic(); //merging all 8 image tiles
+// Urban areas
+var urban = combined_img.eq(7);
+var urban_mask = combined_img.mask(urban);
+var urban_clipped = urban_mask.clip(ROI0);
+// Calculating area for Urban areas
+  var area_urban = urban_clipped.multiply(ee.Image.pixelArea());
+  var area_urban_total = area_urban.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ROI0.geometry(),
+    scale: 500,
+    maxPixels: 1e10
+    });
+  var areaB2020_Km2 =  ee.Number(area_urban_total.get('b1')).divide(1000000); //this is the B area for the year 2020
+
+// Cultivated areas
+var crop = combined_img.eq(5);
+var crop_mask = combined_img.mask(crop);
+var crop_clipped = crop_mask.clip(ROI0);
+// Calculating area for Cultivated areas 
+  var area_crop = crop_clipped.multiply(ee.Image.pixelArea()).multiply(ee.Number(0.2)); //because the value for cells is 5 we devide by 5
+  var area_crop_total = area_crop.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ROI0.geometry(),
+    scale: 500,
+    maxPixels: 1e10
+    });
+  var areaA2020_Km2 =  ee.Number(area_crop_total.get('b1')).divide(1000000);
+
+
+// Calculating current AET for cultivated areas
+  var start2020 = 2020; 
+  var end2020 = 2020; 
+  // make a date object
+  //var startdate = '2001-01-01';
+  //var enddate = '2020-01-01';
+  // make a list with years
+  var years = ee.List.sequence(start2020, end2020);
+  // Specify study region
+  var country_names = ['ROI0'];
+  // Get AET
+  var TC2020 = TerraClimate.filterBounds(ROI0.geometry());
+  var aet2020 = TC2020.select('aet');
+  var annualAET2020 = ee.ImageCollection.fromImages(
+    years.map(function (year) {
+      var annual = aet2020
+          .filter(ee.Filter.calendarRange(year, year, 'year'))
+          .sum()
+          .multiply(0.1) // this is the scale factor based on the source
+          .multiply(ee.Image.pixelArea()) // Volume = Area (m2)*Depth(mm)
+          .multiply(0.001) //Depth(m) = Depth (mm)*0.001
+          .multiply(0.000001) //Volume(MCM) = Volume(m3)*0.000001
+          .multiply(crop_clipped).multiply(ee.Number(0.2)); //for cells that has values 5 and then divided by 5
+      return annual
+          .set('year', year)
+          .set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+  }));
+  
+  // Calculating the average of time series for the region (MCM/Year)
+  //var AET_yearsMean_MCM = annualAET.mean();
+  //var AET_yearsMean_MCM_RegionClip = AET_yearsMean_MCM;   //      AET_yearsMean_MCM.clip(ROI0);
+
+  // Reduce the region. 
+  var annualAET2020_mean = annualAET2020.reduce(ee.Reducer.mean()); //just in case if we want to average more than a year
+  var annualAET2020_MCM_RegionSUM = annualAET2020_mean.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ROI0.geometry(),
+    scale: 30,
+    maxPixels: 1e10
+  });
+  var AET2020 = annualAET2020_MCM_RegionSUM;
+
+//---------------------------------------------------------------------------------------------
+  // ------------------------------ Applying water as the limiting resourece using TerraCimate data ---------------------//
+  // set start and end year
+  // Units = MCM/Year = Milion Cubic Meter per Year
+// the net consumption and deficit numbers are from Ministry of Energty data
+// I need to include them in the GIS shape file since they are variable for each feature
+// th way to use them is based on manual as follows:
+  // Maximum level of water consumption = Net water consumption at ROI � Excessive water use at ROI = X17 + X21
+  //var Water_NetConsumption = ee.Number(66300.0); // this is net consumption of water for the whole ROI = X17 
+  //var WaterDeficit = ee.Number(-6400.0);    // water deficit of both surface and grounwater resources  = X21
+  //var WaterRenewable = Water_NetConsumption.add(WaterDeficit);                                      // = X17 + X21
+  // var WaterRenewable = ee.Number(59.9); // I should have add this column to gis layer!
+  var WaterRenewable = ee.Number(61.619); //This number was entered differently before. 
+  
+  var startyear = 2001; 
+  var endyear = 2020; 
+  // make a date object
+  var startdate = '2001-01-01';
+  var enddate = '2020-01-01';
+  // make a list with years
+  var years = ee.List.sequence(startyear, endyear);
+  // Specify study region
+  var country_names = ['ROI0'];
+  // Get AET
+  var TC = TerraClimate.filterBounds(ROI0.geometry());
+  var aet = TC.select('aet');
+  var annualAET = ee.ImageCollection.fromImages(
+    years.map(function (year) {
+      var annual = aet
+          .filter(ee.Filter.calendarRange(year, year, 'year'))
+          .sum()
+          .multiply(0.1) // this is the scale factor based on the source
+          .multiply(ee.Image.pixelArea()) // Volume = Area (m2)*Depth(mm)
+          .multiply(0.001) //Depth(m) = Depth (mm)*0.001
+          .multiply(0.000001); //Volume(MCM) = Volume(m3)*0.000001
+      return annual
+          .set('year', year)
+          .set('system:time_start', ee.Date.fromYMD(year, 1, 1));
+  }));
+  
+  // Calculating the average of time series for the region (MCM/Year)
+  var AET_yearsMean_MCM = annualAET.mean();
+  var AET_yearsMean_MCM_RegionClip = AET_yearsMean_MCM;   //      AET_yearsMean_MCM.clip(ROI0);
+
+  // Reduce the region. 
+  var AET_yearsMean_MCM_Region_justA = AET_yearsMean_MCM_RegionClip.multiply(A);
+  var AET_yearsMean_MCM_RegionSUM = AET_yearsMean_MCM_Region_justA.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ROI0.geometry(),
+    scale: 30,
+    maxPixels: 1e10
+  });
+  //var water = AET_yearsMean_MCM_RegionSUM.get('b1');
+  var tt = ROI0.set('CarryingCapacity', K,
+      'SI Balanced', SI_threshold,
+      'A areas for this SI (km2)', Sorat_km2,
+      'Area available for B (km2)', AreaBKm2, 
+      'Required land for B at this carrying capacity (km2)', B_sum,
+      'WaterRenewable (MCM)', WaterRenewable,
+      'AET_yearsMean_MCM_RegionSUM_just A', AET_yearsMean_MCM_RegionSUM,
+      'A areas for 2020 (km2)', areaA2020_Km2,
+      'AET for 2020 (MCM)', annualAET2020_MCM_RegionSUM
+      );
+//-------------------------------------------- 
+return tt;
+};
+// Carrying capacity assessment in a functional programming way = for scenario 1
+
+// The map() operation takes a function that works on each element independently
+// and returns a value. You define a function that can be applied to the input.
+// Apply Carrying Capacity function to each item in the vector list by using the map() function.
+var CC_forRegions = B_L0.map(CC_function);  // Here we apply the function on featureCollection that we need
+
+// Export the FeatureCollection to a CSV file.
+Export.table.toDrive({
+  collection: CC_forRegions,
+  description:'ResultsL0_SIeq00_TheoricK',
+  fileFormat: 'CSV',
+  selectors: ['FIPS', 'CarryingCapacity', 'SI Balanced',
+  'A areas for this SI (km2)', 'Area available for B (km2)', 
+  'Required land for B at this carrying capacity (km2)',
+  'WaterRenewable (MCM)', 'AET_yearsMean_MCM_RegionSUM_just A',
+  'A areas for 2020 (km2)', 'AET for 2020 (MCM)']  
+});
+
+
